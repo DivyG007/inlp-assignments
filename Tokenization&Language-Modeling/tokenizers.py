@@ -66,6 +66,7 @@ def text_splitting(text):
 
 # whitespace-based tokenizer
 def whitespace_tokenizer(text):
+    text = re.sub(r'([^\w\s])', r' \1 ', text) # separate punctuation
     return text.split()
 
 # regex based tokenizer for english
@@ -74,55 +75,70 @@ def regex_tokenizer_en(text):
     return text
 
 # bpe based tokenizer for english
-def merge(token_ids, target_pair, merged_token_id):
-    """
-    Replace all non-overlapping occurrences of target_pair
-    with merged_token_id in the token sequence.
-    """
-    merged_sequence = []
-    index = 0
+def get_stats(vocab):
+    pairs = defaultdict(int)
+    for word, freq in vocab.items():
+        symbols = word.split()
+        for i in range(len(symbols)-1):
+            pairs[symbols[i], symbols[i+1]] += freq
+    return pairs
 
-    while index < len(token_ids):
-        # Check if the current and next token form the target pair
-        if (
-            index < len(token_ids) - 1 and
-            token_ids[index] == target_pair[0] and
-            token_ids[index + 1] == target_pair[1]
-        ):
-            merged_sequence.append(merged_token_id)
-            index += 2  # Skip both tokens in the merged pair
-        else:
-            merged_sequence.append(token_ids[index])
-            index += 1
+def merge_vocab(pair, v_in):
+    v_out = {}
+    bigram = re.escape(' '.join(pair))
+    p = re.compile(r'(?<!\S)' + bigram + r'(?!\S)')
+    for word in v_in:
+        w_out = p.sub(''.join(pair), word)
+        v_out[w_out] = v_in[word]
+    return v_out
 
-    # the bpe returns merg-rules and not a merged-corpus as these rules will help to tokenize any given new data rather than a merged-corpus
-    return merged_sequence
+def train_bpe(corpus, num_merges):
+    vocab = defaultdict(int)
+    # Pre-tokenize simply by whitespace to preserve word boundaries for BPE
+    # Adding </w> at the end of each word to handle word boundaries
+    for word in whitespace_tokenizer(corpus):
+        vocab[' '.join(list(word)) + ' </w>'] += 1
 
-# stops after num_merges iterations
-def byte_pair_encoding(corpus, num_merges):
-    """
-    BYTE-PAIR ENCODING(C, k) without explicit vocab V.
-    Vocabulary is implicit in the token sequence and merge rules.
-    """
-
-    # initial tokens
-    token_seq = list(corpus)
-
-    merge_rules = {}
-
-    next_token_id = 256 
-
+    merges = []
+    print(f"Starting BPE training ({num_merges} merges)...")
     for i in range(num_merges):
-        pair_counts = Counter(zip(token_seq, token_seq[1:]))
-        if not pair_counts:
+        if (i + 1) % 50 == 0:
+            print(f"  > Progress: {i + 1}/{num_merges} merges...")
+            
+        pairs = get_stats(vocab)
+        if not pairs:
             break
-        most_freq_pair = max(pair_counts, key=pair_counts.get)
-        new_token = next_token_id
-        token_seq = merge(token_seq, most_freq_pair, new_token)
-        merge_rules[most_freq_pair] = new_token
-        next_token_id += 1
+        best = max(pairs, key=pairs.get)
+        vocab = merge_vocab(best, vocab)
+        merges.append(best)
+    
+    return merges
 
-    return merge_rules
+def apply_bpe(text, merges, cache=None):
+    tokens = []
+    if cache is None:
+        cache = {}
+    for word in whitespace_tokenizer(text):
+        if word in cache:
+            tokens.extend(cache[word])
+            continue
+        word_split = " ".join(list(word)) + " </w>"
+        for pair in merges:
+            bigram = " ".join(pair)
+            replacement = "".join(pair)
+            word_split = word_split.replace(bigram, replacement)
+        word_tokens = [tok for tok in word_split.split() if tok != "</w>"]
+        cache[word] = word_tokens
+        tokens.extend(word_tokens)
+    return tokens
+
+def save_bpe_merges(merges, path):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump([list(pair) for pair in merges], f, ensure_ascii=False)
+
+def load_bpe_merges(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return [tuple(pair) for pair in json.load(f)]
 
 # regex based tokenizer for mongolian
 def regex_tokenizer_mn(text):
@@ -169,11 +185,16 @@ def main():
     train_en_concat = " ".join(train_en)
     train_mn_concat = " ".join(train_mn)
 
-    bpe_merges_en = byte_pair_encoding(train_en_concat, num_merges=500)
-    bpe_merges_mn = byte_pair_encoding(train_mn_concat, num_merges=500)
+    bpe_merges_en = train_bpe(train_en_concat, num_merges=5000)
+    bpe_merges_mn = train_bpe(train_mn_concat, num_merges=5000)
 
     print("BPE (EN) merges learned:", len(bpe_merges_en))
     print("BPE (MN) merges learned:", len(bpe_merges_mn))
+
+    # Save merges for later use in language modeling
+    save_bpe_merges(bpe_merges_en, "bpe_merges_en.json")
+    save_bpe_merges(bpe_merges_mn, "bpe_merges_mn.json")
+    print("Saved BPE merges to bpe_merges_en.json and bpe_merges_mn.json")
 
     # Note:
     # - merge rules define the BPE tokenizer
